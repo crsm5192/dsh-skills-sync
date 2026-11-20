@@ -1,0 +1,4 @@
+- insert:
+    - id: skills-sync
+      name: '@local/dsh-skills-sync'
+      config: {}
