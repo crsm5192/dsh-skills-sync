@@ -113,7 +113,12 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         refresh()
-        return () => { if (timer.current) clearTimeout(timer.current) }
+        // Poll state every 10 seconds to update countdown
+        const pollTimer = setInterval(refresh, 10000)
+        return () => { 
+          clearInterval(pollTimer)
+          if (timer.current) clearTimeout(timer.current) 
+        }
       }, [refresh])
 
       const run = useCallback(async (action) => {
@@ -149,6 +154,18 @@ window.__ModuleLoader__.load({
         else if (state.behind > 0) dotColor = '#a371f7'
       }
 
+      // Build title with sync status
+      const syncStatus = state ? [
+        `分支：${state.branch}`,
+        `未提交：${state.dirtyCount}`,
+        `↑${state.ahead} ↓${state.behind}`,
+      ] : ['技能同步']
+      
+      if (state?.autoSyncEnabled) {
+        const nextIn = state.nextSyncIn !== null ? `${state.nextSyncIn}s` : '-'
+        syncStatus.push(`自动：下次 ${nextIn}`)
+      }
+
       return h('div', { style: S.wrap },
         message ? h('div', { style: S.status }, message) : null,
         open ? h('div', { style: S.panel },
@@ -163,7 +180,7 @@ window.__ModuleLoader__.load({
         ) : null,
         h('div', {
           style: S.pill, role: 'button', tabIndex: 0,
-          title: state ? `${state.branch} · 未提交 ${state.dirtyCount} · ↑${state.ahead} ↓${state.behind}` : '技能同步',
+          title: syncStatus.join(' | '),
           onClick: () => setOpen((v) => !v),
           onKeyDown: (event) => {
             if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setOpen((v) => !v) }
@@ -200,6 +217,8 @@ window.__ModuleLoader__.load({
             private: data.config.private !== false,
             autoCreateRepo: data.config.autoCreateRepo !== false,
             discipline: data.config.discipline !== false,
+            autoSync: data.config.autoSync !== false,
+            syncInterval: data.config.syncInterval || 300,
           })
         } else {
           setMessage({ kind: 'error', text: '无法读取当前配置' })
@@ -339,6 +358,45 @@ window.__ModuleLoader__.load({
             h('input', { type: 'checkbox', checked: form.discipline, onChange: set('discipline') }),
             '向 Agent 注入技能存档纪律（要求自建技能写入上述目录）',
           ),
+        ),
+
+        // ── auto-sync section ──────────────────────────────────────────
+        h('div', { style: { marginTop: '24px', borderTop: '1px solid var(--dsw-alias-border-default, rgba(128,128,128,0.2))', paddingTop: '18px' } },
+          h('div', { style: { ...S.title, fontSize: '14px', marginBottom: '8px' } }, '定时自动同步'),
+          h('div', { style: S.desc }, 
+            '后台定时检查本地与远端仓库的差异，发现远端有新提交时自动拉取。'),
+          
+          h('div', { style: { ...S.field, marginTop: '14px' } },
+            h('label', { style: S.check },
+              h('input', { type: 'checkbox', checked: form.autoSync, onChange: set('autoSync') }),
+              '启用定时自动同步',
+            ),
+          ),
+
+          form.autoSync ? h('div', { style: S.field },
+            h('label', { style: S.label }, '同步频率'),
+            h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
+              h('select', {
+                style: { ...S.input, flex: 1 },
+                value: String(form.syncInterval),
+                onChange: (e) => setForm({ ...form, syncInterval: Number.parseInt(e.target.value, 10) }),
+              },
+                h('option', { value: '60' }, '每 1 分钟'),
+                h('option', { value: '120' }, '每 2 分钟'),
+                h('option', { value: '300' }, '每 5 分钟（推荐）'),
+                h('option', { value: '600' }, '每 10 分钟'),
+                h('option', { value: '1800' }, '每 30 分钟'),
+                h('option', { value: '3600' }, '每 1 小时'),
+              ),
+            ),
+            h('div', { style: S.hint }, 
+              '自动同步仅拉取远端更新，不会自动推送本地改动。' +
+              '如需推送请使用悬浮按钮或手动点击推送。'),
+          ) : null,
+
+          config?.tokenConfigured === false && form.autoSync ? h('div', { 
+            style: { ...S.msg('error'), marginTop: '12px' } 
+          }, '⚠️ 尚未配置访问令牌，自动同步可能无法拉取私有仓库。请先在上方配置 token。') : null,
         ),
 
         message ? h('div', { style: S.msg(message.kind) }, message.text) : null,

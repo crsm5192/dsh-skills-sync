@@ -35,6 +35,8 @@ function normalizeConfig(raw) {
     autoCreateRepo: input.autoCreateRepo !== false,
     routePrefix: str(input.routePrefix, '/api/skills-sync'),
     discipline: input.discipline !== false,
+    autoSync: input.autoSync !== false,
+    syncInterval: typeof input.syncInterval === 'number' && input.syncInterval >= 60 ? input.syncInterval : 300, // 默认 5 分钟
   }
 }
 
@@ -230,6 +232,96 @@ export function apply(ctx, rawConfig) {
   const base = cfg.routePrefix.replace(/\/+$/, '')
   const disposers = []
 
+  // ── auto-sync task ──────────────────────────────────────────────────────
+
+  let lastSyncTime = null
+  let nextSyncTime = Date.now() + (cfg.syncInterval * 1000)
+  let syncTaskId = null
+
+  /** Perform a single sync cycle: fetch + pull if needed */
+  async function performSync(reason = 'auto') {
+    try {
+      // Everything that can throw belongs inside the try, including the helper
+      // lookup: this function is called without await, so a synchronous throw
+      // would become a rejected promise nobody handles.
+      const path = repoPath()
+      await readToken()
+
+      ctx.logger.info(`skills-sync: starting ${reason} sync at ${new Date().toISOString()}`)
+
+      // Fetch latest from all remotes
+      const fetch = await git(path, ['fetch', '--all', '--prune'])
+      if (!fetch.ok) {
+        ctx.logger.warn(`skills-sync: fetch failed: ${fetch.stderr}`)
+        return { ok: false, reason: 'fetch', ...fetch }
+      }
+
+      // Check if we need to pull (only if upstream exists and differs)
+      const upstream = await git(path, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
+      if (upstream.ok && upstream.stdout.length > 0) {
+        const diff = await git(path, ['rev-list', '--left-right', '--count', '@{u}...HEAD'])
+        if (diff.ok && diff.stdout) {
+          const [behind] = diff.stdout.split(/\s+/).map(Number.parseInt)
+
+          // Only pull if there are behind commits (remote has new changes)
+          if (behind > 0) {
+            const pull = await git(path, ['pull', '--rebase', '--autostash'])
+            if (!pull.ok) {
+              ctx.logger.warn(`skills-sync: pull failed: ${pull.stderr}`)
+              return { ok: false, reason: 'pull', ...pull }
+            }
+          }
+        }
+      }
+
+      lastSyncTime = Date.now()
+      nextSyncTime = Date.now() + (cfg.syncInterval * 1000)
+
+      ctx.logger.info(`skills-sync: ${reason} sync completed successfully`)
+      return { ok: true, reason, lastSyncTime, nextSyncTime }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      ctx.logger.error(`skills-sync: ${reason} sync error: ${message}`)
+      return { ok: false, reason, message }
+    }
+  }
+
+  /** Start the periodic sync task */
+  function startSyncTask() {
+    if (syncTaskId) clearInterval(syncTaskId)
+
+    syncTaskId = setInterval(() => {
+      if (!cfg.autoSync) {
+        nextSyncTime = Date.now() + (cfg.syncInterval * 1000)
+        return
+      }
+      // Never leave the promise unhandled: an unhandled rejection terminates
+      // the Host process.
+      void performSync('scheduled').catch((error) => {
+        ctx.logger.warn(`skills-sync: scheduled sync rejected: ${error instanceof Error ? error.message : String(error)}`)
+      })
+    }, cfg.syncInterval * 1000)
+
+    // Do not keep the process alive just for this timer.
+    syncTaskId.unref?.()
+
+    void performSync('startup').catch((error) => {
+      ctx.logger.warn(`skills-sync: startup sync rejected: ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
+  
+  /** Stop the periodic sync task */
+  function stopSyncTask() {
+    if (syncTaskId) {
+      clearInterval(syncTaskId)
+      syncTaskId = null
+    }
+  }
+  
+  // Stop sync task when plugin deactivates. The task itself is started further
+  // down, after the helpers it calls have been initialized.
+  disposers.push(stopSyncTask)
+
   /**
    * The effective repository path: the configured one, or the DSH agents home
    * skills directory when the user left it empty.
@@ -262,6 +354,13 @@ export function apply(ctx, rawConfig) {
     return `https://${encodeURIComponent(user)}:${encodeURIComponent(token)}@${parsed.host}/${parsed.owner}/${parsed.repo}.git`
   }
 
+  // ── start the periodic sync task ─────────────────────────────────────────
+  // Placement matters: `performSync` reads `repoPath` and `readToken`, which are
+  // `const` initializers above. Calling this before they are initialized throws
+  // a TDZ ReferenceError inside an async function, which escapes as an unhandled
+  // rejection and terminates the Host process on startup.
+  startSyncTask()
+
   // ── floating-button RPCs ─────────────────────────────────────────────────
 
   disposers.push(ctx.webServer.register({
@@ -273,7 +372,20 @@ export function apply(ctx, rawConfig) {
         res.end()
         return
       }
-      json(res, 200, { ok: true, state: await readState(repoPath(), cfg.branch) })
+      const state = await readState(repoPath(), cfg.branch)
+      json(res, 200, {
+        ok: true,
+        state: {
+          ...state,
+          // Auto-sync status
+          autoSyncEnabled: cfg.autoSync,
+          syncIntervalSeconds: cfg.syncInterval,
+          lastSyncTime: lastSyncTime ? new Date(lastSyncTime).toISOString() : null,
+          nextSyncTime: cfg.autoSync ? new Date(nextSyncTime).toISOString() : null,
+          lastSyncAgo: lastSyncTime ? Math.floor((Date.now() - lastSyncTime) / 1000) : null,
+          nextSyncIn: cfg.autoSync ? Math.max(0, Math.floor((nextSyncTime - Date.now()) / 1000)) : null,
+        },
+      })
     },
   }))
 
@@ -407,6 +519,10 @@ export function apply(ctx, rawConfig) {
         private: typeof body.private === 'boolean' ? body.private : cfg.private,
         autoCreateRepo: typeof body.autoCreateRepo === 'boolean' ? body.autoCreateRepo : cfg.autoCreateRepo,
         discipline: typeof body.discipline === 'boolean' ? body.discipline : cfg.discipline,
+        autoSync: typeof body.autoSync === 'boolean' ? body.autoSync : cfg.autoSync,
+        syncInterval: typeof body.syncInterval === 'number' && body.syncInterval >= 60 
+          ? body.syncInterval 
+          : cfg.syncInterval,
       }
 
       // The token goes to the credential store, never into configuration.
