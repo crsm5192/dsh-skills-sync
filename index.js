@@ -11,6 +11,7 @@
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import fs from 'node:fs/promises'
 
 const execFileAsync = promisify(execFile)
 
@@ -245,9 +246,28 @@ export function apply(ctx, rawConfig) {
       // lookup: this function is called without await, so a synchronous throw
       // would become a rejected promise nobody handles.
       const path = repoPath()
-      await readToken()
+      const token = await readToken()
 
       ctx.logger.info(`skills-sync: starting ${reason} sync at ${new Date().toISOString()}`)
+
+      // Make sure the repository exists (creates the directory and initialises
+      // git when this is a fresh machine). Without this the first `git fetch`
+      // fails with "not a git repository" on every new install.
+      if (cfg.remoteUrl) {
+        const ensured = await ensureRepo(path, cfg, token)
+        if (!ensured.ok) {
+          ctx.logger.warn(`skills-sync: repository bootstrap failed: ${JSON.stringify(ensured.steps)}`)
+          return { ok: false, reason: 'bootstrap', steps: ensured.steps }
+        }
+      } else {
+        // No remote configured yet: still make sure the directory exists so the
+        // agent's archive discipline points at a real path.
+        try {
+          await fs.mkdir(path, { recursive: true })
+        } catch {
+          /* a pre-existing directory is fine */
+        }
+      }
 
       // Fetch latest from all remotes
       const fetch = await git(path, ['fetch', '--all', '--prune'])
@@ -332,6 +352,72 @@ export function apply(ctx, rawConfig) {
     return `${home}\\skills`
   }
 
+  /**
+   * Ensure a git repository exists at `path`:
+   * - Create directory if missing
+   * - If not a git repo: init + add remote + fetch origin/<branch>
+   * Returns { ok, steps[] }.
+   */
+  async function ensureRepo(path, cfg, token) {
+    const steps = []
+    // 1. create directory if missing
+    try {
+      await fs.mkdir(path, { recursive: true })
+      steps.push({ step: 'mkdir', ok: true, created: true })
+    } catch (err) {
+      // mkdir failure is non-fatal; continue to see if repo already exists
+      steps.push({ step: 'mkdir', ok: false, error: err.message })
+    }
+    // 2. check if it's a git repo
+    const hasGit = await git(path, ['rev-parse', '--git-dir'])
+    if (hasGit.ok) {
+      // Already a repo. Only touch the remote when it is missing or when a
+      // token must be injected: rewriting an identical URL on every sync just
+      // churns `.git/config` and produces noise in the diff.
+      const currentUrl = await git(path, ['remote', 'get-url', 'origin'])
+      const authed = token ? authedRemote(cfg.remoteUrl, token, cfg.username) : cfg.remoteUrl
+      const missing = !currentUrl.ok
+      const needsToken = Boolean(token) && !currentUrl.stdout.includes('@')
+      if (missing || needsToken) {
+        const setUrl = missing
+          ? await git(path, ['remote', 'add', 'origin', authed])
+          : await git(path, ['remote', 'set-url', 'origin', authed])
+        steps.push({ step: missing ? 'remote-add' : 'remote-set', ...setUrl })
+      }
+      return { ok: true, steps, created: false }
+    }
+    // 3. not a repo: initialize
+    const init = await git(path, ['init', '--initial-branch', cfg.branch])
+    steps.push({ step: 'init', ...init })
+    if (!init.ok) {
+      return { ok: false, steps }
+    }
+    // 4. add remote
+    const url = token ? authedRemote(cfg.remoteUrl, token, cfg.username) : cfg.remoteUrl
+    const remoteAdd = await git(path, ['remote', 'add', 'origin', url])
+    steps.push({ step: 'remote-add', ...remoteAdd })
+    if (!remoteAdd.ok) {
+      return { ok: false, steps }
+    }
+    // 5. fetch remote branch
+    const fetch = await git(path, ['fetch', 'origin', '--prune'])
+    steps.push({ step: 'fetch', ...fetch })
+    if (!fetch.ok) {
+      return { ok: false, steps }
+    }
+    // 6. point the local branch at the remote one when it exists. A brand-new
+    // empty remote has no commit yet: keep the fresh local branch and let the
+    // caller push the first commit instead of failing here.
+    const remoteRef = await git(path, ['rev-parse', '--verify', '--quiet', `origin/${cfg.branch}`])
+    if (!remoteRef.ok || !remoteRef.stdout) {
+      steps.push({ step: 'checkout', ok: true, skipped: '远端分支尚不存在' })
+      return { ok: true, steps, created: true, empty: true }
+    }
+    const checkout = await git(path, ['checkout', '-B', cfg.branch, `origin/${cfg.branch}`])
+    steps.push({ step: 'checkout', ...checkout })
+    return { ok: checkout.ok, steps, created: true }
+  }
+
   /** Read the token from the credential store; never from configuration. */
   const readToken = async () => {
     const credentials = ctx.get('credentials')
@@ -402,6 +488,25 @@ export function apply(ctx, rawConfig) {
       const path = repoPath()
       const token = await readToken()
 
+      // Bootstrap the repository when it is missing or not yet a git repo.
+      // A fresh machine has no ~/.agents/skills at all, so without this the
+      // first pull fails with "fatal: not a git repository".
+      if (cfg.remoteUrl) {
+        const ensured = await ensureRepo(path, cfg, token)
+        if (!ensured.ok) {
+          json(res, 500, { ok: false, step: 'bootstrap', steps: ensured.steps, state: await readState(path, cfg.branch) })
+          return
+        }
+      } else {
+        try {
+          await fs.mkdir(path, { recursive: true })
+        } catch {
+          /* ignore */
+        }
+        json(res, 400, { ok: false, step: 'config', reason: '尚未配置远程仓库地址', state: await readState(path, cfg.branch) })
+        return
+      }
+
       if (token) {
         const url = await git(path, ['remote', 'get-url', 'origin'])
         if (url.ok) {
@@ -414,6 +519,29 @@ export function apply(ctx, rawConfig) {
         json(res, 500, { ok: false, step: 'fetch', ...fetch, state: await readState(path, cfg.branch) })
         return
       }
+
+      // `git pull` needs an upstream; a repository bootstrapped from an empty
+      // remote has none yet, and a repo with local-only commits may not either.
+      // Fall back to an explicit reset onto the remote branch in that case.
+      const upstream = await git(path, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
+      if (!upstream.ok || !upstream.stdout) {
+        const remoteRef = await git(path, ['rev-parse', '--verify', '--quiet', `origin/${cfg.branch}`])
+        if (!remoteRef.ok) {
+          json(res, 200, {
+            ok: true,
+            step: 'pull',
+            message: '远端仓库还没有提交，无需拉取',
+            state: await readState(path, cfg.branch),
+          })
+          return
+        }
+        const set = await git(path, ['branch', '--set-upstream-to', `origin/${cfg.branch}`, cfg.branch])
+        if (!set.ok) {
+          json(res, 500, { ok: false, step: 'upstream', ...set, state: await readState(path, cfg.branch) })
+          return
+        }
+      }
+
       const pull = await git(path, ['pull', '--rebase', '--autostash'])
       json(res, pull.ok ? 200 : 500, { ok: pull.ok, step: 'pull', ...pull, state: await readState(path, cfg.branch) })
     },
@@ -431,6 +559,23 @@ export function apply(ctx, rawConfig) {
       await readBody(req)
       const path = repoPath()
       const token = await readToken()
+
+      // Bootstrap the repository when it is missing or not yet a git repo.
+      if (cfg.remoteUrl) {
+        const ensured = await ensureRepo(path, cfg, token)
+        if (!ensured.ok) {
+          json(res, 500, { ok: false, step: 'bootstrap', steps: ensured.steps, state: await readState(path, cfg.branch) })
+          return
+        }
+      } else {
+        try {
+          await fs.mkdir(path, { recursive: true })
+        } catch {
+          /* ignore */
+        }
+        json(res, 400, { ok: false, step: 'config', reason: '尚未配置远程仓库地址', state: await readState(path, cfg.branch) })
+        return
+      }
 
       const add = await git(path, ['add', '-A'])
       if (!add.ok) {
@@ -627,6 +772,13 @@ export function apply(ctx, rawConfig) {
       const token = typeof body.token === 'string' && body.token ? body.token : await readToken()
 
       const steps = []
+      // The target directory may not exist yet on a fresh machine.
+      try {
+        await fs.mkdir(path, { recursive: true })
+        steps.push({ step: 'mkdir', ok: true })
+      } catch (error) {
+        steps.push({ step: 'mkdir', ok: false, message: error instanceof Error ? error.message : String(error) })
+      }
       const hasGit = await git(path, ['rev-parse', '--git-dir'])
       if (!hasGit.ok) {
         const init = await git(path, ['init', '--initial-branch', branch])
