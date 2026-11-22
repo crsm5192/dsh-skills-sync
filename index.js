@@ -101,7 +101,7 @@ async function readState(repoPath, branch) {
     ahead,
     behind,
     lastCommit: last.ok ? last.stdout : '',
-    remoteUrl: remote.ok ? remote.stdout : '',
+    remoteUrl: remote.ok ? stripCredentials(remote.stdout) : '',
     hasUpstream: upstream.ok && upstream.stdout.length > 0,
   }
 }
@@ -132,12 +132,48 @@ async function readBody(req) {
   }
 }
 
-/** Parse `https://github.com/owner/name(.git)` into its parts. */
+/**
+ * Parse `https://github.com/owner/name(.git)` into its parts.
+ *
+ * Tolerates URLs that already carry credentials, including the malformed
+ * `user:tok@user:tok@host` form produced when a token is injected twice: the
+ * host is whatever follows the LAST `@`, so repeated credentials collapse
+ * instead of being mistaken for a port.
+ */
 function parseRemote(url) {
-  const match = /^https?:\/\/([^/]+)\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url.trim())
-  if (!match) return undefined
-  const [, host, owner, repo] = match
-  return { host, owner, repo }
+  const trimmed = String(url ?? '').trim()
+  const scheme = /^https?:\/\/(.+)$/.exec(trimmed)
+  if (!scheme) return undefined
+  const rest = scheme[1]
+  const slash = rest.indexOf('/')
+  if (slash < 0) return undefined
+  let authority = rest.slice(0, slash)
+  const pathPart = rest.slice(slash + 1)
+  const at = authority.lastIndexOf('@')
+  if (at >= 0) authority = authority.slice(at + 1)
+  // Drop a trailing port so `host:443` compares equal to `host`.
+  authority = authority.replace(/:\d+$/, '')
+  const segments = pathPart.split('/').filter(Boolean)
+  if (segments.length < 2) return undefined
+  const owner = segments[0]
+  const repo = segments[1].replace(/\.git$/, '')
+  if (!authority || !owner || !repo) return undefined
+  return { host: authority, owner, repo }
+}
+
+/** Build an authenticated remote URL without exposing the token to the UI. */
+function authedRemote(url, token, username) {
+  const parsed = parseRemote(url)
+  if (!parsed || !token) return url
+  const user = username || parsed.owner
+  return `https://${encodeURIComponent(user)}:${encodeURIComponent(token)}@${parsed.host}/${parsed.owner}/${parsed.repo}.git`
+}
+
+/** Strip credentials from a remote URL, for display and logging. */
+function stripCredentials(url) {
+  const parsed = parseRemote(url)
+  if (!parsed) return String(url ?? '')
+  return `https://${parsed.host}/${parsed.owner}/${parsed.repo}.git`
 }
 
 /** Ask the hosting API whether the repository exists and is reachable. */
@@ -435,14 +471,6 @@ export function apply(ctx, rawConfig) {
       /* treat an unreadable record as absent */
     }
     return ''
-  }
-
-  /** Build an authenticated remote URL without exposing the token to the UI. */
-  const authedRemote = (url, token, username) => {
-    const parsed = parseRemote(url)
-    if (!parsed || !token) return url
-    const user = username || parsed.owner
-    return `https://${encodeURIComponent(user)}:${encodeURIComponent(token)}@${parsed.host}/${parsed.owner}/${parsed.repo}.git`
   }
 
   // ── start the periodic sync task ─────────────────────────────────────────
