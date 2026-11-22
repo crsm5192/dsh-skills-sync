@@ -12,8 +12,13 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import fs from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const execFileAsync = promisify(execFile)
+
+/** Absolute directory of this plugin, used by the self-update endpoint. */
+const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url))
 
 export const name = 'skills-sync'
 
@@ -821,6 +826,124 @@ export function apply(ctx, rawConfig) {
       try { dispose() } catch { /* already disposed */ }
     }
   })
+
+  // ── self-update ──────────────────────────────────────────────────────────
+  //
+  // The plugin is installed either as a symlink to a development checkout or as
+  // a copy produced by `plugin_manager install_bundle`. In the first case the
+  // installation directory is itself a git checkout, so it can pull its own
+  // updates. In the second case it is a plain directory and there is nothing to
+  // pull; the UI then tells the user to reinstall instead.
+
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${base}/update/status`,
+    async handler(req, res) {
+      const result = await updateStatus()
+      json(res, 200, result)
+    },
+  }))
+
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: `${base}/update`,
+    async handler(req, res) {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { allow: 'POST' })
+        res.end()
+        return
+      }
+      await readBody(req)
+
+      const status = await updateStatus()
+      if (!status.git) {
+        json(res, 200, {
+          ok: false,
+          reason: 'not-a-checkout',
+          message: '当前安装目录不是 git 检出，无法自更新。请重新克隆插件目录后重装，或等待发布到插件市场。',
+          ...status,
+        })
+        return
+      }
+
+      // Refuse to clobber local edits: the update must be a fast-forward.
+      const dirty = await git(PLUGIN_DIR, ['status', '--porcelain'])
+      const uncommitted = dirty.ok ? dirty.stdout.trim() : ''
+      if (uncommitted.length > 0) {
+        json(res, 200, {
+          ok: false,
+          reason: 'dirty',
+          message: '插件目录存在未提交改动，已跳过更新以免覆盖本地修改。请先提交或还原后再试。',
+          dirty: uncommitted.split('\n').slice(0, 20),
+          ...status,
+        })
+        return
+      }
+
+      const fetch = await git(PLUGIN_DIR, ['fetch', '--prune'])
+      if (!fetch.ok) {
+        json(res, 500, { ok: false, step: 'fetch', ...fetch, ...status })
+        return
+      }
+
+      const before = await git(PLUGIN_DIR, ['rev-parse', 'HEAD'])
+      const pull = await git(PLUGIN_DIR, ['merge', '--ff-only', `origin/${status.branch}`])
+      if (!pull.ok) {
+        json(res, 500, { ok: false, step: 'merge', ...pull, ...status })
+        return
+      }
+      const after = await git(PLUGIN_DIR, ['rev-parse', 'HEAD'])
+      const changed = before.ok && after.ok ? before.stdout !== after.stdout : true
+
+      json(res, 200, {
+        ok: true,
+        changed,
+        branch: status.branch,
+        from: before.ok ? before.stdout.slice(0, 7) : undefined,
+        to: after.ok ? after.stdout.slice(0, 7) : undefined,
+        message: changed
+          ? '插件已更新到最新版本。请重启 DSH（或禁用再启用插件）并刷新页面使新代码生效。'
+          : '已经是最新版本，无需更新。',
+        ...status,
+      })
+    },
+  }))
+
+  /**
+   * Inspect whether the installation directory is a git checkout that can be
+   * updated in place, and report its version relative to the remote.
+   */
+  async function updateStatus() {
+    const inside = await git(PLUGIN_DIR, ['rev-parse', '--git-dir'])
+    if (!inside.ok) {
+      return { git: false, dir: PLUGIN_DIR, version: await pluginVersion() }
+    }
+    const branchRef = await git(PLUGIN_DIR, ['rev-parse', '--abbrev-ref', 'HEAD'])
+    const branch = branchRef.ok && branchRef.stdout !== 'HEAD' ? branchRef.stdout : 'main'
+    const head = await git(PLUGIN_DIR, ['log', '-1', '--pretty=%h%x20%s'])
+    const remote = await git(PLUGIN_DIR, ['remote', 'get-url', 'origin'])
+    const behind = await git(PLUGIN_DIR, ['rev-list', '--count', `HEAD..origin/${branch}`])
+    return {
+      git: true,
+      dir: PLUGIN_DIR,
+      branch,
+      remote: remote.ok ? remote.stdout : undefined,
+      head: head.ok ? head.stdout : undefined,
+      behind: behind.ok ? Number.parseInt(behind.stdout, 10) || 0 : null,
+      version: await pluginVersion(),
+    }
+  }
+
+  /** Read this plugin's own package version. */
+  async function pluginVersion() {
+    try {
+      const raw = await fs.readFile(path.join(PLUGIN_DIR, 'package.json'), 'utf8')
+      const parsed = JSON.parse(raw)
+      return typeof parsed.version === 'string' ? parsed.version : undefined
+    } catch {
+      return undefined
+    }
+  }
 
   // ── discipline: where self-authored skills must be archived ──────────────
 

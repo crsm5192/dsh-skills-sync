@@ -202,6 +202,7 @@ window.__ModuleLoader__.load({
       const [token, setToken] = useState('')
       const [busy, setBusy] = useState(null)
       const [message, setMessage] = useState(null)
+      const [update, setUpdate] = useState(null)
 
       const load = useCallback(async () => {
         const data = await api('/config').catch(() => undefined)
@@ -225,7 +226,26 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      const checkUpdateStatus = useCallback(async () => {
+        try {
+          const data = await api('/update/status')
+          if (data.ok && data.git) {
+            setUpdate({
+              installed: data.version,
+              branch: data.branch,
+              behind: data.behind || 0,
+              head: data.head,
+            })
+          } else {
+            setUpdate({ git: false, installed: data?.version || 'unknown' })
+          }
+        } catch {
+          setUpdate(null)
+        }
+      }, [])
+
       useEffect(() => { load() }, [load])
+      useEffect(() => { checkUpdateStatus() }, [checkUpdateStatus])
 
       const set = (key) => (event) => {
         const value = event.target.type === 'checkbox' ? event.target.checked : event.target.value
@@ -295,6 +315,20 @@ window.__ModuleLoader__.load({
             ? `${failed[0].step}: ${(failed[0].stderr || failed[0].message || '').split('\n')[0]}`
             : (data.reason || '未知原因')
           setMessage({ kind: 'error', text: `初始化失败：${detail}` })
+        }
+        setBusy(null)
+      }
+
+      const doUpdate = async () => {
+        setBusy('update')
+        setMessage(null)
+        const data = await api('/update', { method: 'POST' })
+          .catch((error) => ({ ok: false, reason: error.message }))
+        if (data.ok) {
+          setMessage({ kind: 'ok', text: data.message || '更新完成，请重启 DSH 并刷新页面。' })
+          await checkUpdateStatus()
+        } else {
+          setMessage({ kind: 'error', text: data.message || data.reason || '更新失败' })
         }
         setBusy(null)
       }
@@ -397,6 +431,35 @@ window.__ModuleLoader__.load({
           config?.tokenConfigured === false && form.autoSync ? h('div', { 
             style: { ...S.msg('error'), marginTop: '12px' } 
           }, '⚠️ 尚未配置访问令牌，自动同步可能无法拉取私有仓库。请先在上方配置 token。') : null,
+        ),
+
+        // ── plugin self-update section ─────────────────────────────────
+        h('div', { style: { marginTop: '24px', borderTop: '1px solid var(--dsw-alias-border-default, rgba(128,128,128,0.2))', paddingTop: '18px' } },
+          h('div', { style: { ...S.title, fontSize: '14px', marginBottom: '8px' } }, '插件更新'),
+          h('div', { style: S.desc },
+            '本插件自身也从 git 更新。更新后需要重启 DSH（或禁用再启用插件）并刷新页面，新代码才会生效。'),
+
+          update === null
+            ? h('div', { style: S.hint }, '正在检查版本…')
+            : update.git === false
+              ? h('div', { style: S.hint },
+                  `当前安装目录不是 git 检出，无法自更新。已安装版本：${update.installed || '未知'}。` +
+                  '请重新克隆插件目录后重装，或使用插件市场升级。')
+              : h('div', { style: S.hint },
+                  `已安装版本：${update.installed || '未知'}` +
+                  (update.branch ? `　分支：${update.branch}` : '') +
+                  (update.behind > 0 ? `　可更新：${update.behind} 个提交` : '　已是最新')),
+
+          update && update.git !== false
+            ? h('div', { style: { ...S.actions, marginTop: '12px' } },
+                h('button', {
+                  type: 'button',
+                  style: S.btn(busy !== null, false),
+                  disabled: busy !== null,
+                  onClick: doUpdate,
+                }, busy === 'update' ? '更新中…' : '检查并更新插件'),
+              )
+            : null,
         ),
 
         message ? h('div', { style: S.msg(message.kind) }, message.text) : null,
