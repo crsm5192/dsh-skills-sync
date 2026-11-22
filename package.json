@@ -7,6 +7,7 @@
     ".": "./index.js",
     "./client": "./client.js",
     "./locale/en.json": "./locale/en.json",
+    "./locale/zh.json": "./locale/zh.json",
     "./icon": "./icon.svg"
   },
   "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "docs/DETAIL.md", "icon.svg"],
