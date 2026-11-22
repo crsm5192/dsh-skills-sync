@@ -310,6 +310,24 @@ export function apply(ctx, rawConfig) {
         }
       }
 
+      // Heal a malformed remote URL. A previous version re-injected the token on
+      // every sync, producing `user:tok@user:tok@host`, which git parses as a
+      // port and rejects. Rewrite it from the configured remote whenever the
+      // stored URL disagrees with what we would build now.
+      if (cfg.remoteUrl) {
+        const currentUrl = await git(path, ['remote', 'get-url', 'origin'])
+        const intended = token ? authedRemote(cfg.remoteUrl, token, cfg.username) : cfg.remoteUrl
+        if (currentUrl.ok && currentUrl.stdout && currentUrl.stdout !== intended) {
+          const atCount = (currentUrl.stdout.match(/@/g) ?? []).length
+          if (atCount > 1 || parseRemote(currentUrl.stdout)?.host !== parseRemote(intended)?.host) {
+            const fixed = await git(path, ['remote', 'set-url', 'origin', intended])
+            ctx.logger.warn(
+              `skills-sync: healed malformed remote URL (${atCount} '@') -> ${stripCredentials(intended)}${fixed.ok ? '' : ` (set-url failed: ${fixed.stderr})`}`,
+            )
+          }
+        }
+      }
+
       // Fetch latest from all remotes
       const fetch = await git(path, ['fetch', '--all', '--prune'])
       if (!fetch.ok) {
