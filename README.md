@@ -56,6 +56,21 @@ git clone https://github.com/crsm5192/dsh-skills-sync.git C:\dsh-plugins\dsh-ski
 - **创建仓库**：在 GitHub / Gitee 上创建该仓库。
 - **初始化本地仓库**：对存档目录执行 `git init`、设置 remote、首次提交并推送。
 
+### 新机器自动引导（v1.1+）
+
+新机器上**不需要手动创建目录或初始化 git**。只要配置里填了「仓库地址」，第一次点「拉取」或自动同步时插件会自动完成：
+
+1. 创建存档目录（如 `C:\Users\<你>\.agents\skills`，不存在就建）
+2. `git init`
+3. `git remote add origin <仓库地址>`
+4. `git fetch origin`
+5. `git checkout -B <分支> origin/<分支>`（远端还没有提交时跳过，等首次推送）
+
+所以全新机器上填好「仓库地址」+「访问令牌」→ 点「拉取」即可，不会再出现
+`fatal: not a git repository (or any of the parent directories): .git`。
+
+> 私有仓库必须先填访问令牌，否则第 4 步会因无法认证而失败（报错显示 `could not read Username`）。
+
 ### 令牌权限
 
 GitHub 细粒度令牌需要：
@@ -134,6 +149,7 @@ GitHub 细粒度令牌需要：
 - 自动创建仓库目前支持 GitHub 与 Gitee；其他托管平台需要手动建库。
 - 修改配置后插件会重启，页面需要刷新才能看到新值。
 - 「初始化本地仓库」对已存在 `origin` 的目录会改写 remote URL。
+- 引导流程对**已有内容但非 git 仓库**的目录会执行 `git init`；如果该目录里已有同名技能文件，`checkout -B` 可能因"untracked files would be overwritten"中止，此时先手工移走或提交这些文件再重试。
 
 ---
 
