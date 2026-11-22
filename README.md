@@ -164,6 +164,7 @@ GitHub 细粒度令牌需要：
 - 「初始化本地仓库」对已存在 `origin` 的目录会改写 remote URL。
 - 引导流程对**已有内容但非 git 仓库**的目录会执行 `git init`；如果该目录里已有同名技能文件，`checkout -B` 可能因"untracked files would be overwritten"中止，此时先手工移走或提交这些文件再重试。
 - **自更新**仅适用于通过克隆源码安装的插件（symlink 或 copy），不适用于从 npm 安装的包。更新后必须重启 DSH 或禁用再启用插件，新代码才会生效。
+- **凭据注入历史问题**：v1.0–v1.2 版本在同步时会重复向远程 URL 添加 token，导致 URL 中出现多个 `@`（如 `user:tok@user:tok@host`），git 误判为端口号而失败。**v1.3+ 会自动检测并修复已损坏的 URL**，无需手动干预。
 
 ---
 
